@@ -42,8 +42,7 @@ def open_ftp():
     ftp = FTPClass(FTP_HOST, timeout=TIMEOUT)
     ftp.login(FTP_USER, FTP_PASS)
     if USE_FTPS:
-        ftp.auth()
-        ftp.prot_p()
+        ftp.auth(); ftp.prot_p()
     ftp.set_pasv(True)
     if FTP_DIR:
         ftp.cwd(FTP_DIR)
@@ -54,7 +53,7 @@ def possible_names(day):
     return [f"{ymd}MGPPrezzi.xml", f"MGPPrezzi_{ymd}.xml", f"Prezzi_{ymd}.xml"]
 
 def retrieve_day(ftp, day):
-    # Nomi tipici
+    # nomi tipici
     for fn in possible_names(day):
         buf = io.BytesIO()
         try:
@@ -62,7 +61,7 @@ def retrieve_day(ftp, day):
             return buf.getvalue()
         except Exception:
             continue
-    # Fallback: cerca con nlst
+    # fallback: cerca con nlst
     try:
         ymd = day.strftime("%Y%m%d")
         files = ftp.nlst()
@@ -110,8 +109,7 @@ def stream_csv(d1, d2):
             for line in iter_rows_from_xml(xml, day):
                 yield line
     finally:
-        try:
-            ftp.quit()
+        try: ftp.quit()
         except Exception:
             pass
 
@@ -145,7 +143,11 @@ def download():
     return Response(
         stream_csv(d1, d2),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Access-Control-Allow-Origin": "*",        # CORS anche qui
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        }
     )
 
 if __name__ == "__main__":
