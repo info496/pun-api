@@ -23,13 +23,18 @@ def daterange(d1, d2):
         d += timedelta(days=1)
 
 def _dec(s):
-    if not s: return None
-    try: return float(s.replace(",", ".").strip())
-    except: return None
+    if not s: 
+        return None
+    try:
+        return float(s.replace(",", ".").strip())
+    except Exception:
+        return None
 
 def _safe_int(s):
-    try: return int((s or "").strip())
-    except: return None
+    try:
+        return int((s or "").strip())
+    except Exception:
+        return None
 
 # ====== FTP ======
 def open_ftp():
@@ -37,9 +42,11 @@ def open_ftp():
     ftp = FTPClass(FTP_HOST, timeout=TIMEOUT)
     ftp.login(FTP_USER, FTP_PASS)
     if USE_FTPS:
-        ftp.auth(); ftp.prot_p()
+        ftp.auth()
+        ftp.prot_p()
     ftp.set_pasv(True)
-    if FTP_DIR: ftp.cwd(FTP_DIR)
+    if FTP_DIR:
+        ftp.cwd(FTP_DIR)
     return ftp
 
 def possible_names(day):
@@ -47,6 +54,7 @@ def possible_names(day):
     return [f"{ymd}MGPPrezzi.xml", f"MGPPrezzi_{ymd}.xml", f"Prezzi_{ymd}.xml"]
 
 def retrieve_day(ftp, day):
+    # Nomi tipici
     for fn in possible_names(day):
         buf = io.BytesIO()
         try:
@@ -54,6 +62,7 @@ def retrieve_day(ftp, day):
             return buf.getvalue()
         except Exception:
             continue
+    # Fallback: cerca con nlst
     try:
         ymd = day.strftime("%Y%m%d")
         files = ftp.nlst()
@@ -68,10 +77,12 @@ def retrieve_day(ftp, day):
         pass
     return None
 
+# ====== Parser ======
 def iter_rows_from_xml(xml_bytes, the_date):
+    """Genera righe CSV: data;ora;PUN (PUN con virgola)."""
     root = ET.fromstring(xml_bytes)
     for n in root.iter():
-        if n.tag.split("}",1)[-1] != "Prezzi":
+        if n.tag.split("}", 1)[-1] != "Prezzi":
             continue
         data_str = the_date.strftime("%Y-%m-%d")
         ora = _safe_int(n.findtext("Ora")) or ""
@@ -83,6 +94,7 @@ def iter_rows_from_xml(xml_bytes, the_date):
             pun_str = (str(val).replace(".", ",")) if val is not None else pun_txt
         yield f"{data_str};{ora};{pun_str}\n"
 
+# ====== CSV streaming ======
 def stream_csv(d1, d2):
     yield "data;ora;PUN\n"
     try:
@@ -98,15 +110,21 @@ def stream_csv(d1, d2):
             for line in iter_rows_from_xml(xml, day):
                 yield line
     finally:
-        try: ftp.quit()
-        except: pass
+        try:
+            ftp.quit()
+        except Exception:
+            pass
 
-# ---- healthcheck super rapido (usato dalla pagina per evitare la splash page di Render)
+# ---- healthcheck con CORS (per ping da Wix) ----
 @app.route("/health")
 def health():
-    return "ok", 200
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    }
+    return ("ok", 200, headers)
 
-# ---- download CSV
+# ---- download CSV (solo CSV) ----
 @app.route("/download")
 def download():
     start = request.args.get("start")
