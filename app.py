@@ -1,102 +1,62 @@
+from flask import Flask, request, send_file, abort
 import os
 import io
-import ftplib
-import xml.etree.ElementTree as ET
+from ftplib import FTP
 from datetime import datetime, timedelta
-
-from flask import Flask, request, send_file, abort
+import xml.etree.ElementTree as ET
 import pandas as pd
 
 app = Flask(__name__)
 
-# ========= Config via ENV =========
-# Legge prima GME_FTP_*, altrimenti FTP_* (per compatibilità con le tue variabili esistenti)
-FTP_HOST = os.getenv("GME_FTP_HOST") or os.getenv("FTP_HOST") or "download.mercatoelettrico.org"
-FTP_USER = os.getenv("GME_FTP_USER") or os.getenv("FTP_USER")
-FTP_PASS = os.getenv("GME_FTP_PASS") or os.getenv("FTP_PASS")
-FTP_DIR  = os.getenv("GME_FTP_DIR")  or os.getenv("FTP_PATH") or "/MercatiElettrici/MGP_Prezzi"
-
-# FTPS opzionale: imposta USE_FTPS=1 su Render se richiesto
-USE_FTPS = (os.getenv("USE_FTPS") or os.getenv("FTPS") or "0") == "1"
-
-# Timeout più alto per range lunghi
-TIMEOUT  = int(os.getenv("FTP_TIMEOUT", "120"))
-
-# Soglia oltre la quale evitiamo XLSX reale (free tier) e serviamo CSV compatibile Excel
-XLSX_SAFE_DAYS = int(os.getenv("XLSX_SAFE_DAYS", "28"))
+# ---- Variabili ambiente (Render → Environment) ----
+FTP_HOST = os.getenv("GME_FTP_HOST")
+FTP_USER = os.getenv("GME_FTP_USER")
+FTP_PASS = os.getenv("GME_FTP_PASS")
+FTP_PATH = os.getenv("GME_FTP_PATH", "/MercatiElettrici/MGP_Prezzi")
 
 
-# ========= Utility =========
-def daterange(d1, d2):
-    cur = d1
-    while cur <= d2:
-        yield cur
-        cur += timedelta(days=1)
-
-
-def possible_filenames(d):
-    """Diversi pattern visti sul GME."""
-    ymd = d.strftime("%Y%m%d")
-    return [
-        f"{ymd}MGPPrezzi.xml",     # es. 20250817MGPPrezzi.xml
-        f"MGPPrezzi_{ymd}.xml",    # variante
-        f"Prezzi_{ymd}.xml"        # ultima spiaggia
-    ]
-
-
-def dec(txt):
-    if not txt:
-        return None
-    return float(txt.replace(",", ".").strip())
-
-
-def parse_xml(xml_bytes, day):
-    """Parsa il file XML e ritorna righe con data, ora, PUN e zone principali."""
-    root = ET.fromstring(xml_bytes)
-    rows = []
-    for n in root.findall(".//Prezzi"):
-        rows.append({
-            "data": day.strftime("%Y-%m-%d"),
-            "ora": int((n.findtext("Ora") or "0")),
-            "PUN": dec(n.findtext("PUN")),
-            "NORD": dec(n.findtext("NORD")),
-            "CNOR": dec(n.findtext("CNOR")),
-            "CSUD": dec(n.findtext("CSUD")),
-            "SUD":  dec(n.findtext("SUD")),
-            "SICI": dec(n.findtext("SICI")),
-            "SARD": dec(n.findtext("SARD")),
-        })
-    return rows
+# ---- Utilità ----
+def daterange(start_date, end_date):
+    """Genera tutte le date tra start_date e end_date inclusi"""
+    for n in range((end_date - start_date).days + 1):
+        yield start_date + timedelta(n)
 
 
 def open_ftp():
-    """Apre UNA sola connessione FTP/FTPS sulla cartella desiderata."""
-    FTPClass = ftplib.FTP_TLS if USE_FTPS else ftplib.FTP
-    ftp = FTPClass(FTP_HOST, timeout=TIMEOUT)
+    """Apre connessione FTP al GME"""
+    ftp = FTP(FTP_HOST)
     ftp.login(FTP_USER, FTP_PASS)
-    if USE_FTPS:
-        # Protegge anche il canale dati
-        ftp.auth()
-        ftp.prot_p()
-    ftp.set_pasv(True)
-    if FTP_DIR:
-        ftp.cwd(FTP_DIR)
+    ftp.cwd(FTP_PATH)
     return ftp
 
 
 def retrieve_day(ftp, day):
-    """Tenta i vari nomi file per la data indicata e ritorna i bytes, oppure None."""
-    for fname in possible_filenames(day):
-        buf = io.BytesIO()
-        try:
-            ftp.retrbinary(f"RETR {fname}", buf.write)
-            return buf.getvalue()
-        except Exception:
-            continue
-    return None
+    """Scarica file XML di un singolo giorno"""
+    filename = f"PrezziMGP_{day.strftime('%Y%m%d')}.xml"
+    bio = io.BytesIO()
+    try:
+        ftp.retrbinary(f"RETR {filename}", bio.write)
+        bio.seek(0)
+        return bio.read()
+    except Exception:
+        return None
 
 
-# ========= Endpoint =========
+def parse_xml(xml_bytes, day):
+    """Parsa XML PUN giornaliero e ritorna lista di righe"""
+    rows = []
+    try:
+        root = ET.fromstring(xml_bytes)
+        for elem in root.findall(".//PrezzoOra"):
+            ora = int(elem.find("Ora").text)
+            pun = float(elem.find("PUN").text.replace(",", "."))
+            rows.append({"data": day, "ora": ora, "pun": pun})
+    except Exception:
+        return []
+    return rows
+
+
+# ---- API principale ----
 @app.route("/download")
 def download():
     if not (FTP_USER and FTP_PASS):
@@ -119,7 +79,7 @@ def download():
     if d2 < d1:
         return abort(400, "end dev’essere >= start")
 
-    # ---- Scarico con UNA SOLA CONNESSIONE FTP per tutto l'intervallo ----
+    # ---- Scarico unico con stessa connessione FTP ----
     all_rows = []
     try:
         ftp = open_ftp()
@@ -130,8 +90,6 @@ def download():
         for day in daterange(d1, d2):
             xml = retrieve_day(ftp, day)
             if not xml:
-                # Se vuoi fallire quando manca un giorno, decommenta la riga seguente:
-                # ftp.quit(); return abort(404, f"File mancante per {day}")
                 continue
             all_rows.extend(parse_xml(xml, day))
     finally:
@@ -139,33 +97,23 @@ def download():
             ftp.quit()
         except Exception:
             pass
-    # ---------------------------------------------------------------------
 
     if not all_rows:
         return abort(404, "Nessun dato trovato nell’intervallo richiesto.")
 
     df = pd.DataFrame(all_rows).sort_values(["data", "ora"])
 
-    # ---- Gestione formati: CSV sempre, XLSX reale solo per range 'sicuri' ----
-    total_days = (d2 - d1).days + 1
-
-    if fmt == "csv" or total_days > XLSX_SAFE_DAYS:
-        # CSV (leggero). Se l'utente ha chiesto xlsx ma il range è grande,
-        # serviamo CSV con mimetype compatibile così Excel lo apre senza problemi.
+    # ---- Output CSV ----
+    if fmt == "csv":
         data = df.to_csv(index=False).encode("utf-8")
-        mimetype = "text/csv"
-        fname = f"PUN_{d1}_{d2}.csv"
-        if fmt == "xlsx" and total_days > XLSX_SAFE_DAYS:
-            mimetype = "application/vnd.ms-excel"  # compatibile Excel
-            fname = f"PUN_{d1}_{d2}.xlsx"          # contenuto CSV
         return send_file(
             io.BytesIO(data),
-            mimetype=mimetype,
+            mimetype="text/csv",
             as_attachment=True,
-            download_name=fname
+            download_name=f"PUN_{d1}_{d2}.csv"
         )
 
-    # XLSX reale (intervalli entro la soglia)
+    # ---- Output XLSX (reale, sempre valido) ----
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         df.to_excel(w, sheet_name="PUN", index=False)
@@ -179,4 +127,4 @@ def download():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    app.run(host="0.0.0.0", port=5000)
