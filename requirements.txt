@@ -1,3 +1,4 @@
-flask
-gunicorn
-xlsxwriter
+  flask>=3.0.0
+gunicorn>=21.2.0
+pandas>=2.0.0
+openpyxl>=3.1.0
