@@ -6,14 +6,14 @@ import pandas as pd
 app = Flask(__name__)
 
 # ========= Config via ENV =========
-FTP_HOST = os.getenv("GME_FTP_HOST", "download.mercatoelettrico.org")
-FTP_USER = os.getenv("GME_FTP_USER")      # es: PANIPUCCIM
-FTP_PASS = os.getenv("GME_FTP_PASS")      # es: ********
-FTP_DIR  = os.getenv("GME_FTP_DIR", "/MercatiElettrici/MGP_Prezzi")
-USE_FTPS = os.getenv("USE_FTPS", "0") == "1"   # se serve FTPS, metti 1 nelle env di Render
-TIMEOUT  = int(os.getenv("FTP_TIMEOUT", "45"))
+# Legge prima GME_FTP_*, altrimenti FTP_*
+FTP_HOST = os.getenv("GME_FTP_HOST") or os.getenv("FTP_HOST") or "download.mercatoelettrico.org"
+FTP_USER = os.getenv("GME_FTP_USER") or os.getenv("FTP_USER")
+FTP_PASS = os.getenv("GME_FTP_PASS") or os.getenv("FTP_PASS")
+FTP_DIR  = os.getenv("GME_FTP_DIR")  or os.getenv("FTP_PATH") or "/MercatiElettrici/MGP_Prezzi"
+USE_FTPS = (os.getenv("USE_FTPS") or os.getenv("FTPS") or "0") == "1"
+TIMEOUT  = int(os.getenv("FTP_TIMEOUT", "120"))  # più alto per range lunghi
 
-# ========= Util =========
 def daterange(d1, d2):
     cur = d1
     while cur <= d2:
@@ -23,13 +23,13 @@ def daterange(d1, d2):
 def possible_filenames(d):
     ymd = d.strftime("%Y%m%d")
     return [
-        f"{ymd}MGPPrezzi.xml",     # es: 20250817MGPPrezzi.xml (già visto)
+        f"{ymd}MGPPrezzi.xml",     # es. 20250817MGPPrezzi.xml
         f"MGPPrezzi_{ymd}.xml",    # variante
-        f"Prezzi_{ymd}.xml"        # ultima spiaggia
+        f"Prezzi_{ymd}.xml"
     ]
 
 def dec(txt):
-    if txt is None: return None
+    if not txt: return None
     return float(txt.replace(",", ".").strip())
 
 def parse_xml(xml_bytes, day):
@@ -40,7 +40,6 @@ def parse_xml(xml_bytes, day):
             "data": day.strftime("%Y-%m-%d"),
             "ora": int((n.findtext("Ora") or "0")),
             "PUN": dec(n.findtext("PUN")),
-            # opzionale: alcune zone utili (puoi aggiungerne altre)
             "NORD": dec(n.findtext("NORD")),
             "CNOR": dec(n.findtext("CNOR")),
             "CSUD": dec(n.findtext("CSUD")),
@@ -50,28 +49,27 @@ def parse_xml(xml_bytes, day):
         })
     return rows
 
-def fetch_xml(day):
-    # FTP o FTPS in base a USE_FTPS
+def open_ftp():
     FTPClass = ftplib.FTP_TLS if USE_FTPS else ftplib.FTP
-    with FTPClass(FTP_HOST, timeout=TIMEOUT) as ftp:
-        ftp.login(FTP_USER, FTP_PASS)
-        if USE_FTPS:
-            # protezione canale dati su FTPS
-            ftp.auth()
-            ftp.prot_p()
-        ftp.set_pasv(True)
-        if FTP_DIR:
-            ftp.cwd(FTP_DIR)
-        for fname in possible_filenames(day):
-            buf = io.BytesIO()
-            try:
-                ftp.retrbinary(f"RETR {fname}", buf.write)
-                return buf.getvalue()
-            except Exception:
-                continue
+    ftp = FTPClass(FTP_HOST, timeout=TIMEOUT)
+    ftp.login(FTP_USER, FTP_PASS)
+    if USE_FTPS:
+        ftp.auth(); ftp.prot_p()
+    ftp.set_pasv(True)
+    if FTP_DIR:
+        ftp.cwd(FTP_DIR)
+    return ftp
+
+def retrieve_day(ftp, day):
+    for fname in possible_filenames(day):
+        buf = io.BytesIO()
+        try:
+            ftp.retrbinary(f"RETR {fname}", buf.write)
+            return buf.getvalue()
+        except Exception:
+            continue
     return None
 
-# ========= Endpoint =========
 @app.route("/download")
 def download():
     if not (FTP_USER and FTP_PASS):
@@ -95,12 +93,26 @@ def download():
         return abort(400, "end dev’essere >= start")
 
     all_rows = []
-    for day in daterange(d1, d2):
-        xml = fetch_xml(day)
-        if not xml:
-            # se un giorno non c'è, lo saltiamo (puoi cambiare in 'abort' se vuoi strict)
-            continue
-        all_rows.extend(parse_xml(xml, day))
+    # ----- UNA SOLA CONNESSIONE PER TUTTO L'INTERVALLO -----
+    try:
+        ftp = open_ftp()
+    except Exception as e:
+        return abort(502, f"Connessione FTP fallita: {e}")
+
+    try:
+        for day in daterange(d1, d2):
+            xml = retrieve_day(ftp, day)
+            if not xml:
+                # Se vuoi fallire quando manca un giorno:
+                # ftp.quit(); return abort(404, f"File mancante per {day}")
+                continue
+            all_rows.extend(parse_xml(xml, day))
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+    # --------------------------------------------------------
 
     if not all_rows:
         return abort(404, "Nessun dato trovato nell’intervallo richiesto.")
