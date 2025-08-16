@@ -16,7 +16,10 @@ FTP_DIR  = os.getenv("GME_FTP_DIR")  or os.getenv("GME_FTP_PATH") or os.getenv("
 USE_FTPS = (os.getenv("USE_FTPS") or os.getenv("FTPS") or "0") == "1"
 TIMEOUT  = int(os.getenv("FTP_TIMEOUT", "120"))
 
-ZONES = ["NORD","CNOR","CSUD","SUD","SICI","SARD","CALA","NAT"]  # estendibile
+# XLSX reale per intervalli fino a questa soglia; oltre produciamo un CSV (più leggero)
+XLSX_SAFE_DAYS = int(os.getenv("XLSX_SAFE_DAYS", "28"))
+
+ZONES = ["NORD","CNOR","CSUD","SUD","SICI","SARD","CALA","NAT"]  # opzionale
 
 
 # ========= Utility =========
@@ -31,9 +34,11 @@ def _dec(txt):
         return None
     return float(txt.replace(",", ".").strip())
 
-def _tagname(el):
-    # rimuove eventuale namespace
-    return el.tag.split("}", 1)[-1]
+def _safe_int(txt):
+    try:
+        return int((txt or "").strip())
+    except Exception:
+        return None
 
 
 # ========= FTP helpers =========
@@ -48,38 +53,38 @@ def open_ftp():
         ftp.cwd(FTP_DIR)
     return ftp
 
-def retrieve_day(ftp, day):
-    """
-    Prova prima con elenco 'nlst' cercando un file che contenga YYYYMMDD
-    e 'MGPPrezzi' (o 'Prezzi'). Se non trovato, prova una lista di nomi standard.
-    Ritorna bytes oppure None.
-    """
+def possible_filenames(day):
     ymd = day.strftime("%Y%m%d")
-    try:
-        files = ftp.nlst()
-    except Exception:
-        files = []
+    return [
+        f"{ymd}MGPPrezzi.xml",     # es. 20250817MGPPrezzi.xml
+        f"MGPPrezzi_{ymd}.xml",    # variante
+        f"Prezzi_{ymd}.xml",       # ultima spiaggia
+    ]
 
-    # candidati tramite lista
-    cand = [f for f in files if ymd in f and ("MGPPrezzi" in f or "Prezzi" in f)]
-    # ordina per lunghezza (spesso quello 'giusto' è corto)
-    cand.sort(key=len)
-
-    tried = []
-    for fname in cand + [
-        f"{ymd}MGPPrezzi.xml",
-        f"MGPPrezzi_{ymd}.xml",
-        f"Prezzi_{ymd}.xml",
-    ]:
-        if fname in tried:
-            continue
-        tried.append(fname)
+def retrieve_day(ftp, day):
+    # tenta i nomi standard
+    for fname in possible_filenames(day):
         buf = io.BytesIO()
         try:
             ftp.retrbinary(f"RETR {fname}", buf.write)
             return buf.getvalue()
         except Exception:
             continue
+    # come fallback: prova a cercare con nlst
+    try:
+        files = ftp.nlst()
+        ymd = day.strftime("%Y%m%d")
+        cands = [f for f in files if ymd in f and ("MGPPrezzi" in f or "Prezzi" in f)]
+        cands.sort(key=len)
+        for fname in cands:
+            buf = io.BytesIO()
+            try:
+                ftp.retrbinary(f"RETR {fname}", buf.write)
+                return buf.getvalue()
+            except Exception:
+                continue
+    except Exception:
+        pass
     return None
 
 
@@ -87,32 +92,24 @@ def retrieve_day(ftp, day):
 def parse_xml(xml_bytes, the_date):
     """
     Estrae righe con: data, ora, PUN e (opzionale) zone.
-    Struttura tipica: molti nodi <Prezzi> con figli: Ora, PUN, NORD, SUD, ...
+    Struttura tipica: nodi <Prezzi> con figli: Ora, PUN, NORD, SUD, ...
     """
     rows = []
     root = ET.fromstring(xml_bytes)
-
-    # cerca tutti i nodi che si chiamano 'Prezzi' ignorando namespace
-    prezzi_nodes = [n for n in root.iter() if _tagname(n) == "Prezzi"]
-    for n in prezzi_nodes:
+    for n in root.iter():
+        if n.tag.split("}", 1)[-1] != "Prezzi":
+            continue
         rec = {
             "data": the_date.strftime("%Y-%m-%d"),
-            "ora": _safe_int(n.findtext("./Ora")),
-            "PUN": _dec(n.findtext("./PUN")),
+            "ora": _safe_int(n.findtext("Ora")),
+            "PUN": _dec(n.findtext("PUN")),
         }
         for z in ZONES:
-            v = n.findtext("./" + z)
+            v = n.findtext(z)
             if v is not None:
                 rec[z] = _dec(v)
         rows.append(rec)
-
     return rows
-
-def _safe_int(txt):
-    try:
-        return int((txt or "").strip())
-    except Exception:
-        return None
 
 
 # ========= Endpoint =========
@@ -149,11 +146,10 @@ def download():
         for day in daterange(d1, d2):
             xml = retrieve_day(ftp, day)
             if not xml:
-                # se vuoi essere "rigoroso", decommenta:
+                # se vuoi "strict", decommenta:
                 # ftp.quit(); return abort(404, f"File mancante per {day}")
                 continue
-            rows = parse_xml(xml, day)
-            all_rows.extend(rows)
+            all_rows.extend(parse_xml(xml, day))
     finally:
         try:
             ftp.quit()
@@ -165,14 +161,17 @@ def download():
 
     df = pd.DataFrame(all_rows).sort_values(["data", "ora"])
 
-    if fmt == "csv":
+    total_days = (d2 - d1).days + 1
+
+    # ---- CSV (sempre ok, anche per intervalli lunghi) ----
+    if fmt == "csv" or total_days > XLSX_SAFE_DAYS:
         data = df.to_csv(index=False).encode("utf-8")
         return send_file(io.BytesIO(data),
                          mimetype="text/csv",
                          as_attachment=True,
                          download_name=f"PUN_{d1}_{d2}.csv")
 
-    # XLSX reale (sempre)
+    # ---- XLSX reale (entro la soglia) ----
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         df.to_excel(w, sheet_name="PUN", index=False)
